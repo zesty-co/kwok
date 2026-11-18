@@ -19,6 +19,7 @@ package lifecycle_test
 import (
 	"context"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,6 +28,91 @@ import (
 	"sigs.k8s.io/kwok/pkg/apis/internalversion"
 	"sigs.k8s.io/kwok/pkg/utils/lifecycle"
 )
+
+func TestLifecycleConcurrentInitialization(t *testing.T) {
+	var configs []*internalversion.Stage
+	for _, weight := range []int{1, 0} {
+		configs = append(configs, &internalversion.Stage{
+			Spec: internalversion.StageSpec{
+				Selector: &internalversion.StageSelector{
+					MatchExpressions: []internalversion.MatchExpression{{
+						CEL: &internalversion.ExpressionCEL{Expression: `self.spec.nodeName == "node-a"`},
+					}},
+				},
+				Weight: weight,
+			},
+		})
+	}
+	stages, err := lifecycle.NewLifecycle(configs)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const workers = 32
+	start := make(chan struct{})
+	var ready, done sync.WaitGroup
+	ready.Add(workers)
+	done.Add(workers)
+	for range workers {
+		go func() {
+			defer done.Done()
+			event := &lifecycle.Event{Data: &corev1.Pod{Spec: corev1.PodSpec{NodeName: "node-a"}}}
+			ready.Done()
+			<-start
+			stage, err := stages.Match(context.Background(), event)
+			if err != nil {
+				t.Errorf("Match() failed: %v", err)
+				return
+			}
+			if stage != stages[0] {
+				t.Errorf("Match() = %v, want the positive-weight stage", stage)
+			}
+		}()
+	}
+	ready.Wait()
+	close(start)
+	done.Wait()
+}
+
+func TestLifecycleInitializationRetry(t *testing.T) {
+	stages, err := lifecycle.NewLifecycle([]*internalversion.Stage{{
+		Spec: internalversion.StageSpec{
+			Selector: &internalversion.StageSelector{
+				MatchExpressions: []internalversion.MatchExpression{{
+					CEL: &internalversion.ExpressionCEL{Expression: `enabled`},
+				}},
+			},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tt := range []struct {
+		name      string
+		variables map[string]any
+		wantError bool
+		wantMatch bool
+	}{
+		{name: "missing variable", wantError: true},
+		{name: "retry with false condition", variables: map[string]any{"enabled": false}},
+		{name: "true condition", variables: map[string]any{"enabled": true}, wantMatch: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			event := &lifecycle.Event{Data: &corev1.Pod{}, CELVariables: tt.variables}
+			stage, err := stages.Match(context.Background(), event)
+			if (err != nil) != tt.wantError {
+				t.Fatalf("Match() error = %v, want error = %v", err, tt.wantError)
+			}
+			if tt.wantMatch {
+				if stage != stages[0] {
+					t.Fatalf("Match() = %v, want configured stage", stage)
+				}
+			} else if stage != nil {
+				t.Fatalf("Match() = %v, want no matching stage", stage)
+			}
+		})
+	}
+}
 
 func TestLifecycleJitterDurationFrom(t *testing.T) {
 	baseMilliseconds := int64(1000)

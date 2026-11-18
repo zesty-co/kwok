@@ -24,6 +24,7 @@ import (
 	"reflect"
 	"regexp"
 	"slices"
+	"sync"
 	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -207,6 +208,9 @@ func NewStage(s *internalversion.Stage) *Stage {
 }
 
 func (s *Stage) init(event *Event) error {
+	s.initMu.Lock()
+	defer s.initMu.Unlock()
+
 	if s.env != nil {
 		return nil
 	}
@@ -224,16 +228,25 @@ func (s *Stage) init(event *Event) error {
 	if err != nil {
 		return err
 	}
-	s.env = env
+	// Publish compiled state only after every step succeeds, so failed
+	// initialization can be retried without exposing partial selectors or getters.
+	var (
+		matchLabels      labels.Selector
+		matchAnnotations labels.Selector
+		matchExpressions []*expression.Requirement
+		matchConditions  []cel.Program
+		stageDuration    durationGetter
+		stageJitter      durationGetter
+	)
 
 	selector := s.config.Spec.Selector
 	config := s.config
 
 	if selector.MatchLabels != nil {
-		s.matchLabels = labels.SelectorFromSet(selector.MatchLabels)
+		matchLabels = labels.SelectorFromSet(selector.MatchLabels)
 	}
 	if selector.MatchAnnotations != nil {
-		s.matchAnnotations = labels.SelectorFromSet(selector.MatchAnnotations)
+		matchAnnotations = labels.SelectorFromSet(selector.MatchAnnotations)
 	}
 	if selector.MatchExpressions != nil {
 		for _, express := range selector.MatchExpressions {
@@ -243,20 +256,19 @@ func (s *Stage) init(event *Event) error {
 				if err != nil {
 					return err
 				}
-				s.matchExpressions = append(s.matchExpressions, requirement)
+				matchExpressions = append(matchExpressions, requirement)
 			case express.CEL != nil:
 				program, err := env.Compile(express.CEL.Expression)
 				if err != nil {
 					return err
 				}
-				s.matchConditions = append(s.matchConditions, program)
+				matchConditions = append(matchConditions, program)
 			default:
 				return fmt.Errorf("invalid expression")
 			}
 		}
 	}
 
-	s.nextSteps = config.Spec.Steps
 	if delay := config.Spec.Delay; delay != nil {
 		var durationFrom *internalversion.ExpressionFrom
 		if delay.DurationFrom != nil {
@@ -270,7 +282,7 @@ func (s *Stage) init(event *Event) error {
 		if err != nil {
 			return err
 		}
-		s.duration = duration
+		stageDuration = duration
 
 		if delay.JitterDurationMilliseconds != nil || delay.JitterDurationFrom != nil {
 			var jitterDurationFrom *internalversion.ExpressionFrom
@@ -285,7 +297,7 @@ func (s *Stage) init(event *Event) error {
 			if err != nil {
 				return err
 			}
-			s.jitterDuration = jitterDurationGetter
+			stageJitter = jitterDurationGetter
 		}
 	}
 
@@ -299,9 +311,16 @@ func (s *Stage) init(event *Event) error {
 		return err
 	}
 
+	s.matchLabels = matchLabels
+	s.matchAnnotations = matchAnnotations
+	s.matchExpressions = matchExpressions
+	s.matchConditions = matchConditions
+	s.nextSteps = config.Spec.Steps
+	s.duration = stageDuration
+	s.jitterDuration = stageJitter
 	s.weight = weightGetter
-
 	s.immediateNextStage = config.Spec.ImmediateNextStage
+	s.env = env
 
 	return nil
 }
@@ -325,7 +344,8 @@ type Stage struct {
 	config                 *internalversion.Stage
 	usesPodResourceContext bool
 
-	env *cel.Environment
+	initMu sync.Mutex
+	env    *cel.Environment
 }
 
 // Event represents a lifecycle event that can be matched against stage conditions
