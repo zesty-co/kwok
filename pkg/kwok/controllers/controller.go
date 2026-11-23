@@ -560,6 +560,7 @@ func (c *Controller) initNodeController(ctx context.Context, lifecycle resources
 		DisregardStatusWithLabelSelector:      c.conf.DisregardStatusWithLabelSelector,
 		OnNodeManagedFunc:                     c.onNodeManaged,
 		OnNodeUnmanagedFunc:                   c.onNodeUnmanaged,
+		OnNodeReadyFunc:                       c.podOnNodeManageQueue.Add,
 		OnNodeAllocatableChangedFunc: func(nodeName string) {
 			if c.pods != nil {
 				c.pods.NodeAllocatableChanged(nodeName)
