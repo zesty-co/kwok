@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
 
@@ -215,6 +216,7 @@ func (s *Stage) init(event *Event) error {
 		return nil
 	}
 	types := slices.Clone(cel.DefaultTypes)
+	types = append(types, corev1.NodeCondition{}, corev1.PodCondition{}, corev1.ContainerStatus{}, corev1.PodReadinessGate{})
 	conversions := slices.Clone(cel.DefaultConversions)
 	funcs := maps.Clone(cel.DefaultFuncs)
 	methods := maps.Clone(cel.FuncsToMethods(cel.DefaultFuncs))

@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,6 +63,7 @@ type NodeController struct {
 	onNodeManagedFunc                     func(nodeName string)
 	onNodeUnmanagedFunc                   func(nodeName string)
 	onNodeAllocatableChangedFunc          func(nodeName string)
+	onNodeReadyFunc                       func(nodeName string)
 	nodesSets                             utilsmaps.SyncMap[string, *NodeInfo]
 	renderer                              gotpl.Renderer
 	preprocessChan                        chan *corev1.Node
@@ -85,6 +87,7 @@ type NodeControllerConfig struct {
 	OnNodeManagedFunc                     func(nodeName string)
 	OnNodeUnmanagedFunc                   func(nodeName string)
 	OnNodeAllocatableChangedFunc          func(nodeName string)
+	OnNodeReadyFunc                       func(nodeName string)
 	DisregardStatusWithAnnotationSelector string
 	DisregardStatusWithLabelSelector      string
 	NodeIP                                string
@@ -101,8 +104,9 @@ type NodeControllerConfig struct {
 // NodeInfo is the collection of necessary node information
 type NodeInfo struct {
 	StartedContainer atomic.Int64
-	allocatableMut   sync.Mutex
+	statusMut        sync.Mutex
 	allocatable      corev1.ResourceList
+	ready            bool
 }
 
 // NewNodeController creates a new fake nodes controller
@@ -136,6 +140,7 @@ func NewNodeController(conf NodeControllerConfig) (*NodeController, error) {
 		onNodeManagedFunc:                     conf.OnNodeManagedFunc,
 		onNodeUnmanagedFunc:                   conf.OnNodeUnmanagedFunc,
 		onNodeAllocatableChangedFunc:          conf.OnNodeAllocatableChangedFunc,
+		onNodeReadyFunc:                       conf.OnNodeReadyFunc,
 		nodeIP:                                conf.NodeIP,
 		nodeName:                              conf.NodeName,
 		nodePort:                              conf.NodePort,
@@ -530,17 +535,26 @@ func (c *NodeController) patchResource(ctx context.Context, node *corev1.Node, p
 
 // putNodeInfo puts node info
 func (c *NodeController) putNodeInfo(node *corev1.Node) bool {
+	ready := slices.ContainsFunc(node.Status.Conditions, func(condition corev1.NodeCondition) bool {
+		return condition.Type == corev1.NodeReady && condition.Status == corev1.ConditionTrue
+	})
 	nodeInfo, loaded := c.nodesSets.LoadOrStore(node.Name, &NodeInfo{
 		allocatable: node.Status.Allocatable.DeepCopy(),
+		ready:       ready,
 	})
 	if !loaded {
 		return false
 	}
 
-	nodeInfo.allocatableMut.Lock()
-	defer nodeInfo.allocatableMut.Unlock()
+	nodeInfo.statusMut.Lock()
 	changed := !resourceListsEqual(nodeInfo.allocatable, node.Status.Allocatable)
 	nodeInfo.allocatable = node.Status.Allocatable.DeepCopy()
+	becameReady := ready && !nodeInfo.ready
+	nodeInfo.ready = ready
+	nodeInfo.statusMut.Unlock()
+	if becameReady && c.onNodeReadyFunc != nil {
+		c.onNodeReadyFunc(node.Name)
+	}
 	return changed
 }
 
